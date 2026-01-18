@@ -9,8 +9,8 @@ import type {TaskDefinitionPayload} from "../types";
 export function createTask3PromptPreset(): TaskDefinitionPayload {
     return {
         taskNumber: 3,
-        title: "Identify and analyze BMW’s direct emissions (partially answerable by design)",
-        promptMarkdown: `# Task 3 - Identify and analyze BMW’s direct emissions (partially answerable by design)
+        title: "Identify and analyze BMW’s direct emissions",
+        promptMarkdown: `# Task 3 - Identify and analyze BMW’s direct emissions
 
 **Scenario:** You are asked to support an internal discussion about emissions. Your team specifically wants to understand direct emissions caused by the company itself (i.e., Scope 1), and how this metric changes over time.
 
