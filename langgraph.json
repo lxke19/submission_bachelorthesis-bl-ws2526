@@ -1,0 +1,11 @@
+{
+  "node_version": "20",
+  "dependencies": [
+    "."
+  ],
+  "graphs": {
+    "tavilyAgent": "./app/modules/langgraph/agents/tavilyAgent/graph.ts:graph",
+    "dataAwareLLMSystem": "./app/modules/langgraph/agents/dataAwareLLMSystem/graph.ts:graph"
+  },
+  "env": ".env"
+}

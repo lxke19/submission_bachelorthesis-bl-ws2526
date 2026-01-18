@@ -1,0 +1,43 @@
+services:
+  postgres_langgraph:
+    image: postgres:latest
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langgraph
+      POSTGRES_PASSWORD: langgraph_pw
+      POSTGRES_DB: langgraph_db
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata_langgraph:/var/lib/postgresql/data
+
+  postgres_app:
+    image: postgres:latest
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app_pw
+      POSTGRES_DB: app_db
+    ports:
+      - "55433:5432"
+    volumes:
+      - pgdata_app:/var/lib/postgresql/data
+
+  postgres_esg:
+    image: postgres:latest
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: esg
+      POSTGRES_PASSWORD: esg_pw
+      POSTGRES_DB: esg_db
+    ports:
+      - "55434:5432"
+    volumes:
+      - pgdata_esg:/var/lib/postgresql/data
+      - ./data:/data:ro
+      - ./db/esg/init:/docker-entrypoint-initdb.d:ro
+
+volumes:
+  pgdata_langgraph:
+  pgdata_app:
+  pgdata_esg:

@@ -1,0 +1,38 @@
+[
+  {
+    "key": "companies.csv",
+    "path": "raw/companies.csv",
+    "displayName": "ESG Companies (raw)",
+    "origin": "Local CSV import (/data)",
+    "author": "Auto-import",
+    "fileType": "csv",
+    "hasHeader": true,
+    "tables": [
+      "esg.companies"
+    ]
+  },
+  {
+    "key": "indicator_metadata.csv",
+    "path": "raw/indicator_metadata.csv",
+    "displayName": "ESG Indicator Metadata (raw)",
+    "origin": "Local CSV import (/data)",
+    "author": "Auto-import",
+    "fileType": "csv",
+    "hasHeader": true,
+    "tables": [
+      "esg.indicator_metadata"
+    ]
+  },
+  {
+    "key": "esg_indicators_postprocessed.csv",
+    "path": "processed/esg_indicators_postprocessed.csv",
+    "displayName": "ESG Indicators Postprocessed (processed)",
+    "origin": "Local CSV import (/data)",
+    "author": "Auto-import",
+    "fileType": "csv",
+    "hasHeader": true,
+    "tables": [
+      "esg.esg_indicators_postprocessed"
+    ]
+  }
+]

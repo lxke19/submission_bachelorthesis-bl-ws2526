@@ -1,0 +1,59 @@
+app/modules/management/surveys/presets/Instructions.txt
+
+How to build/edit survey template presets
+=========================================
+
+What is a preset?
+- A preset is the default "SurveyTemplatePayload" for one fixed template key.
+- Keys are fixed by validation and the wizard flow:
+  pre, task1_post, task2_post, task3_post, final
+
+Where to edit templates:
+- Edit these files:
+  - presets/pre.ts
+  - presets/task1_post.ts
+  - presets/task2_post.ts
+  - presets/task3_post.ts
+  - presets/final.ts
+
+Each preset must return a SurveyTemplatePayload:
+- shape:
+  {
+    key: "pre" | "task1_post" | "task2_post" | "task3_post" | "final";
+    name: string;
+    description?: string;
+    questions: SurveyQuestionPayload[];
+  }
+
+Question rules (important):
+- key: must be UNIQUE within the template and stable for exports.
+- order: should be stable and increasing (recommended: 10,20,30,...).
+- required: keep true unless you intentionally want optional questions.
+
+Recommended helper functions:
+- Use presets/builders.ts to keep files short:
+  - singleChoice(key, text, order, options?)
+  - multiChoice(key, text, order, options?)
+  - likert7(key, text, order)
+  - nrs10(key, text, order)
+  - textQuestion(key, text, order)
+  - templateBase(key, name, description, questions)
+
+Examples:
+- Add a new Likert question:
+  likert7(`${key}_likert_02`, "Likert (1-7): The answer was easy to understand.", 70)
+
+- Add a text question:
+  textQuestion(`${key}_text_01`, "What confused you the most?", 80)
+
+Choice options:
+- SINGLE_CHOICE and MULTI_CHOICE require at least 2 options.
+- Option values must be unique within a question.
+
+Where presets are wired in:
+- defaults.ts loads templates via getSurveyTemplatePreset(key).
+- defaults.ts still contains the old buildTemplate fallback (safety + nothing removed).
+
+If something breaks:
+- defaults.ts will fall back to the old template builder automatically.
+- Fix the preset shape (key/questions/order) and try again.

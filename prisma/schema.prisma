@@ -1,0 +1,1056 @@
+// prisma/schema.prisma
+//
+// PURPOSE (App DB):
+// - Store study structure (tasks + surveys) for reproducibility.
+// - Store participants (access code, status, current step) for one-time participation & routing.
+// - Store timestamps/counters so durations and usage metrics are easy to analyze.
+// - Store chat transcript (user + assistant) and minimal tool-call logs (success/failure + output).
+//
+// NOT IN THIS DB:
+// - LangGraph checkpoint tables (separate Postgres via LANGGRAPH_POSTGRES_URL).
+// - Dataset DB used by SQL agent (separate SQL database).
+//
+// DESIGN PRINCIPLES:
+// - Analytics-friendly: numeric scales stored as Int; choices stored by option.value.
+// - Append-only chat: every regeneration becomes a new assistant message (no “rewind”).
+// - No StepRuns: durations measured via explicit startedAt/submittedAt timestamps.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// If Error "Url required" shows up, ignore it! It's an IDE
+
+/**
+ * =========================
+ * ADMIN USERS (Management)
+ * =========================
+ */
+
+enum UserRole {
+  ADMIN
+}
+
+model User {
+  /// What: Primary key (UUID) for the admin user.
+  /// Why: Stable identifier for auth + audit.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Login identifier (used as username); must be unique.
+  /// Why: Prevent duplicate accounts and ensure deterministic login.
+  email String @unique
+
+  /// What: Bcrypt password hash.
+  /// Why: Authenticate securely without storing plaintext passwords.
+  passwordHash String
+
+  /// What: Optional display name.
+  /// Why: Convenience for UI and exports.
+  name String?
+
+  /// What: Role enum.
+  /// Why: Future-proof permission checks.
+  role UserRole @default(ADMIN)
+
+  /// What: Creation time.
+  /// Why: Audit trail.
+  createdAt DateTime @default(now())
+
+  /// What: Update time.
+  /// Why: Audit trail for changes.
+  updatedAt DateTime @updatedAt
+
+  /// What: TOTP secret.
+  /// Why: Verify 2FA codes.
+  twoFactorSecret String?
+
+  /// What: 2FA enabled flag.
+  /// Why: Enforce TOTP only when enabled.
+  twoFactorEnabled Boolean @default(false)
+
+  /// What: Failed login counter.
+  /// Why: Brute-force protection logic.
+  failedLoginAttempts Int @default(0)
+
+  /// What: Locked flag.
+  /// Why: Block login after too many failures.
+  isLocked Boolean @default(false)
+
+  /// What: Permanent lock flag.
+  /// Why: Manual/irreversible lock option.
+  permanentLock Boolean @default(false)
+
+  /// What: Unlock token.
+  /// Why: One-time unlock via link.
+  unlockToken String?
+
+  /// What: Unlock token expiry.
+  /// Why: Prevent old tokens being used.
+  unlockTokenExpiresAt DateTime?
+
+  @@index([email])
+}
+
+/**
+ * =========================
+ * STUDY + PARTICIPANTS
+ * =========================
+ */
+
+enum ParticipantStatus {
+  /// What: Participant record created but not started.
+  /// Why: Management creates participants before usage.
+  CREATED
+
+  /// What: Participant started at least once.
+  /// Why: Enable timing + “in progress” status.
+  STARTED
+
+  /// What: Participant completed the full study.
+  /// Why: Enforce one-time participation and analysis grouping.
+  COMPLETED
+
+  /// What: Participant withdrew.
+  /// Why: Exclude or treat separately in analysis.
+  WITHDRAWN
+
+  /// What: Entry invalidated.
+  /// Why: Data cleaning and audit.
+  INVALIDATED
+}
+
+enum ParticipantStep {
+  /// What: Welcome screen (enter access code).
+  /// Why: Routing start point.
+  WELCOME
+
+  /// What: Baseline survey.
+  /// Why: Phase label for routing.
+  PRE_SURVEY
+
+  TASK1_CHAT
+  TASK1_POST_SURVEY
+  TASK2_CHAT
+  TASK2_POST_SURVEY
+  TASK3_CHAT
+  TASK3_POST_SURVEY
+
+  /// What: Final survey.
+  /// Why: Phase label for routing.
+  FINAL_SURVEY
+
+  /// What: Done screen.
+  /// Why: Block further participation and show completion info.
+  DONE
+}
+
+enum ChatbotVariant {
+  /// What: Condition A.
+  /// Why: Between-subject comparison.
+  VARIANT_1
+
+  /// What: Condition B.
+  /// Why: Between-subject comparison.
+  VARIANT_2
+}
+
+model Study {
+  /// What: Primary key for a study.
+  /// Why: Allows multiple studies using same app.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Stable code key (e.g. "ws2526-main").
+  /// Why: Easy lookup in code and exports.
+  key String @unique
+
+  /// What: Human-readable name.
+  /// Why: Management UI/export clarity.
+  name String
+
+  /// What: Optional description.
+  /// Why: Documentation.
+  description String?
+
+  /// What: Created timestamp.
+  /// Why: Audit/versioning.
+  createdAt DateTime @default(now())
+
+  /// What: Updated timestamp.
+  /// Why: Audit/versioning.
+  updatedAt DateTime @updatedAt
+
+  /// What: Task definitions.
+  /// Why: Reproducible tasks not hardcoded in UI.
+  tasks TaskDefinition[]
+
+  /// What: Survey templates.
+  /// Why: Reproducible question sets.
+  surveyTemplates SurveyTemplate[]
+
+  /// What: Participants.
+  /// Why: Join anchor for analysis.
+  participants Participant[]
+}
+
+model Participant {
+  /// What: Internal UUID.
+  /// Why: Stable join key.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: The code participants type in; unique.
+  /// Why: One-time participation + routing lookup.
+  accessCode String @unique @default(uuid())
+
+  /// What: Optional human-friendly label (e.g. "P001").
+  /// Why: Easier admin workflow + exports without using UUIDs as identifiers.
+  participantLabel String?
+
+  /// What: Study foreign key.
+  /// Why: Scope participant to one study.
+  studyId String @db.Uuid
+  study   Study  @relation(fields: [studyId], references: [id], onDelete: Restrict)
+
+  /// What: Status.
+  /// Why: Block re-entry after completion and support data cleaning.
+  status ParticipantStatus @default(CREATED)
+
+  /// What: Assigned variant/condition.
+  /// Why: Later compare Variant 1 vs Variant 2 statistically.
+  assignedVariant ChatbotVariant
+
+  /// What: Side panel enabled flag.
+  /// Why: UI behavior is reproducible and analyzable.
+  sidePanelEnabled Boolean @default(false)
+
+  /// What: Current step in the study flow.
+  /// Why: Route participant to the correct page after entering code.
+  currentStep ParticipantStep @default(WELCOME)
+
+  /// What: Current task number (1..3) when relevant.
+  /// Why: Simplifies routing and analytics grouping.
+  currentTaskNumber Int?
+
+  /// What: Timestamp of first start (after entering code).
+  /// Why: Measure total duration from start to completion.
+  startedAt DateTime?
+
+  /// What: Timestamp when finished.
+  /// Why: Measure completion time and block re-entry.
+  completedAt DateTime?
+
+  /// What: Timestamp of last activity.
+  /// Why: Detect dropouts and inactivity.
+  lastActiveAt DateTime?
+
+  /// What: Count of how many times participant re-entered the code.
+  /// Why: Quantify interruptions/restarts.
+  reentryCount Int @default(0)
+
+  /// What: Created timestamp.
+  /// Why: Audit.
+  createdAt DateTime @default(now())
+
+  /// What: Updated timestamp.
+  /// Why: Audit.
+  updatedAt DateTime @updatedAt
+
+  /// What: Per-task sessions.
+  /// Why: Group chat + post-survey + metrics per task.
+  taskSessions TaskSession[]
+
+  /// What: Survey instances (pre, post, final).
+  /// Why: Group answers by phase.
+  surveyInstances SurveyInstance[]
+
+  /// What: Each access code entry attempt.
+  /// Why: Track reconnects and entry behavior.
+  accessLogs ParticipantAccessLog[]
+
+  @@unique([studyId, participantLabel])
+  @@index([studyId])
+  @@index([status])
+  @@index([currentStep])
+  @@index([participantLabel])
+}
+
+model ParticipantAccessLog {
+  /// What: Primary key for one access log row.
+  /// Why: Audit and join anchor.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Participant foreign key.
+  /// Why: Analyze re-entries per participant.
+  participantId String      @db.Uuid
+  participant   Participant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+
+  /// What: When the access code was entered.
+  /// Why: Measure gaps and restarts.
+  enteredAt DateTime @default(now())
+
+  /// What: User-Agent string (optional).
+  /// Why: Debug mobile/desktop differences.
+  userAgent String?
+
+  /// What: Optional JSON metadata (viewport, locale, etc.).
+  /// Why: Debugging and segmentation without schema changes.
+  clientMeta Json?
+
+  @@index([participantId, enteredAt])
+}
+
+/**
+ * =========================
+ * TASK DEFINITIONS + SESSIONS
+ * =========================
+ */
+
+model TaskDefinition {
+  /// What: Primary key for a task definition.
+  /// Why: Stable join key for sessions.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Study foreign key.
+  /// Why: Task belongs to one study.
+  studyId String @db.Uuid
+  study   Study  @relation(fields: [studyId], references: [id], onDelete: Cascade)
+
+  /// What: Task number (1..3).
+  /// Why: Ordering and routing.
+  taskNumber Int
+
+  /// What: Title shown in UI.
+  /// Why: Readable exports and UI.
+  title String
+
+  /// What: The task prompt shown to participant.
+  /// Why: Reproducibility (exact wording stored).
+  promptMarkdown String
+
+  /// What: Optional structured constraints/metadata.
+  /// Why: Support source/timeframe checks and later analysis.
+  metadata Json?
+
+  /// What: Created timestamp.
+  /// Why: Audit/versioning.
+  createdAt DateTime @default(now())
+
+  /// What: Updated timestamp.
+  /// Why: Audit/versioning.
+  updatedAt DateTime @updatedAt
+
+  /// What: Sessions referencing this task.
+  /// Why: Analyze behavior per task.
+  sessions TaskSession[]
+
+  @@unique([studyId, taskNumber])
+}
+
+model TaskSession {
+  /// What: Primary key for participant’s run of a task.
+  /// Why: Group chat + post-survey + metrics.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Participant foreign key.
+  /// Why: Join all task data to participant.
+  participantId String      @db.Uuid
+  participant   Participant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+
+  /// What: Task definition foreign key.
+  /// Why: Know which task text/metadata applies.
+  taskDefinitionId String         @db.Uuid
+  taskDefinition   TaskDefinition @relation(fields: [taskDefinitionId], references: [id], onDelete: Restrict)
+
+  /// What: Task number duplicated.
+  /// Why: Easier filtering + uniqueness per participant.
+  taskNumber Int
+
+  /// What: Variant used for this task.
+  /// Why: Analysis per task and variant.
+  chatbotVariant ChatbotVariant
+
+  /// What: When task session started.
+  /// Why: Duration calculations and ordering.
+  startedAt DateTime @default(now())
+
+  /// What: When chat UI opened first time.
+  /// Why: Compute chat time (chatStartedAt → readyToAnswerAt/chatEndedAt).
+  chatStartedAt DateTime?
+
+  /// What: When chat phase ended.
+  /// Why: Compute chat time.
+  chatEndedAt DateTime?
+
+  /// What: Participant has sent at least one user message.
+  /// Why: Enforce “must chat at least once before answering”.
+  hasChattedAtLeastOnce Boolean @default(false)
+
+  /// What: Timestamp when participant clicked “ready to answer”.
+  /// Why: Gate transition to post-survey and compute chat phase duration.
+  readyToAnswerAt DateTime?
+
+  /// What: When post-task survey page opened.
+  /// Why: Compute post-survey duration.
+  postSurveyStartedAt DateTime?
+
+  /// What: When post-task survey submitted.
+  /// Why: Compute post-survey duration.
+  postSurveySubmittedAt DateTime?
+
+  /// What: Total user message count across all threads for this task.
+  /// Why: Simple quantitative metric of engagement.
+  userMessageCount Int @default(0)
+
+  /// What: Total assistant message count across all threads.
+  /// Why: Simple quantitative metric of assistant output volume.
+  assistantMessageCount Int @default(0)
+
+  /// What: How many times participant created a new chat (restart).
+  /// Why: Quantify “chat restart” behavior.
+  chatRestartCount Int @default(0)
+
+  /// What: Side panel opens count.
+  /// Why: Feature usage metric.
+  sidePanelOpenCount Int @default(0)
+
+  /// What: Side panel closes count.
+  /// Why: Feature usage metric.
+  sidePanelCloseCount Int @default(0)
+
+  /// What: Total milliseconds side panel was open.
+  /// Why: Time-based feature usage metric.
+  sidePanelOpenMs BigInt @default(0)
+
+  /// What: Created timestamp.
+  /// Why: Audit.
+  createdAt DateTime @default(now())
+
+  /// What: Updated timestamp.
+  /// Why: Audit.
+  updatedAt DateTime @updatedAt
+
+  /// What: Chat threads (initial + restarts).
+  /// Why: Group transcripts by restart.
+  chatThreads ChatThread[]
+
+  /// What: Side panel open→close spans.
+  /// Why: Accurate duration computations.
+  sidePanelSpans SidePanelSpan[]
+
+  /// What: Survey instances linked to this task (post survey).
+  /// Why: Join task outcomes with chat behavior.
+  surveyInstances SurveyInstance[]
+
+  @@unique([participantId, taskNumber])
+  @@index([participantId])
+  @@index([taskDefinitionId])
+}
+
+/**
+ * =========================
+ * CHAT (append-only)
+ * =========================
+ */
+
+enum ChatThreadStatus {
+  /// What: Thread is currently used.
+  /// Why: UI can identify current transcript.
+  ACTIVE
+
+  /// What: Thread ended.
+  /// Why: Keep history and ensure one active thread.
+  CLOSED
+}
+
+enum ChatThreadCloseReason {
+  /// What: Closed because participant clicked “new chat”.
+  /// Why: Distinguish restart from abandonment.
+  RESTARTED
+
+  /// What: Closed because task chat finished.
+  /// Why: Distinguish normal completion.
+  TASK_FINISHED
+
+  /// What: Closed because participant left/disconnected.
+  /// Why: Distinguish dropout behavior.
+  ABANDONED
+
+  /// What: Closed due to error.
+  /// Why: Debugging.
+  ERROR
+}
+
+enum ChatRole {
+  USER
+  ASSISTANT
+  SYSTEM
+  TOOL
+}
+
+model ChatThread {
+  /// What: Primary key for thread record.
+  /// Why: Join key.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Task session foreign key.
+  /// Why: Thread belongs to one task.
+  taskSessionId String      @db.Uuid
+  taskSession   TaskSession @relation(fields: [taskSessionId], references: [id], onDelete: Cascade)
+
+  /// What: LangGraph thread_id (checkpoint key).
+  /// Why: Lets LangGraph persist state per conversation run.
+  langGraphThreadId String @unique
+
+  /// What: Active/closed status.
+  /// Why: Track which thread is current.
+  status ChatThreadStatus @default(ACTIVE)
+
+  /// What: Why the thread was closed.
+  /// Why: Distinguish restart vs abandonment vs finish.
+  closeReason ChatThreadCloseReason?
+
+  /// What: 0 for initial chat, 1 for first restart, etc.
+  /// Why: Simple restart analytics.
+  restartIndex Int @default(0)
+
+  /// What: Creation timestamp.
+  /// Why: Timing/audit.
+  createdAt DateTime @default(now())
+
+  /// What: Closure timestamp.
+  /// Why: Timing/audit.
+  closedAt DateTime?
+
+  /// What: Messages belonging to this thread.
+  /// Why: Complete transcript reconstruction.
+  messages ChatMessage[]
+
+  /// What: Side panel spans that happened while this thread was active (optional link).
+  /// Why: Prisma requires an opposite relation field for SidePanelSpan.chatThread.
+  sidePanelSpans SidePanelSpan[]
+
+  @@index([taskSessionId, createdAt])
+}
+
+model ChatMessage {
+  /// What: Primary key for a message.
+  /// Why: Join anchor for tool calls and sources.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Thread foreign key.
+  /// Why: Transcript grouping.
+  chatThreadId String     @db.Uuid
+  chatThread   ChatThread @relation(fields: [chatThreadId], references: [id], onDelete: Cascade)
+
+  /// What: Role (user/assistant/tool/system).
+  /// Why: Correct transcript rendering and analysis.
+  role ChatRole
+
+  /// What: Visible content.
+  /// Why: Audit/qualitative inspection.
+  content String
+
+  /// What: Monotonic sequence within a thread.
+  /// Why: Stable ordering without relying solely on timestamps.
+  sequence Int
+
+  /// What: Optional parent sequence this message replies to.
+  /// Why: Link assistant generations to the triggering user message.
+  replyToSequence Int?
+
+  /// What: Timestamp.
+  /// Why: Timing analytics (delays, pace).
+  createdAt DateTime @default(now())
+
+  /// What: Optional token estimate.
+  /// Why: Cost/verbosity analytics.
+  tokenCount Int?
+
+  /// What: Optional latency.
+  /// Why: Performance analytics.
+  latencyMs Int?
+
+  /// What: Extra JSON metadata (citations, debug info).
+  /// Why: Flexibility without schema changes.
+  metadata Json?
+
+  /// What: Tool calls associated with this message.
+  /// Why: Minimal tool usage logging (success/failure + output).
+  toolCalls ChatToolCall[]
+
+  @@unique([chatThreadId, sequence])
+  @@index([chatThreadId, createdAt])
+}
+
+/**
+ * =========================
+ * TOOL CALLS (minimal)
+ * =========================
+ */
+
+enum ToolCallStatus {
+  STARTED
+  SUCCEEDED
+  FAILED
+}
+
+model ChatToolCall {
+  /// What: Primary key for one tool call log row.
+  /// Why: Join anchor and audit.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Message foreign key.
+  /// Why: Link tool use to the exact point in the conversation.
+  chatMessageId String      @db.Uuid
+  chatMessage   ChatMessage @relation(fields: [chatMessageId], references: [id], onDelete: Cascade)
+
+  /// What: Tool identifier (e.g. "sql_query", "web_search").
+  /// Why: Tool usage statistics and debugging.
+  toolName String
+
+  /// What: Success/failure state.
+  /// Why: Reliability measurement and error analysis.
+  status ToolCallStatus @default(SUCCEEDED)
+
+  /// What: Start timestamp.
+  /// Why: Latency measurement.
+  startedAt DateTime @default(now())
+
+  /// What: End timestamp.
+  /// Why: Latency measurement.
+  endedAt DateTime?
+
+  /// What: Structured tool input (e.g. SQL text, parameters).
+  /// Why: Reproducibility and audit without extra SQL tables.
+  input Json?
+
+  /// What: Structured tool output (e.g. rows summary, answer snippets, errors).
+  /// Why: You explicitly want “tool output” saved for control/inspection.
+  output Json?
+
+  /// What: Error message if failed.
+  /// Why: Debugging.
+  errorMessage String?
+
+  @@index([chatMessageId])
+  @@index([toolName, status])
+}
+
+/**
+ * =========================
+ * SIDE PANEL USAGE
+ * =========================
+ */
+
+model SidePanelSpan {
+  /// What: Primary key for one open→close interval.
+  /// Why: Accurate duration computation.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Task session foreign key.
+  /// Why: Side panel usage analyzed per task.
+  taskSessionId String      @db.Uuid
+  taskSession   TaskSession @relation(fields: [taskSessionId], references: [id], onDelete: Cascade)
+
+  /// What: Open timestamp.
+  /// Why: Duration computation.
+  openedAt DateTime @default(now())
+
+  /// What: Close timestamp.
+  /// Why: Duration computation.
+  closedAt DateTime?
+
+  /// What: Message sequence after which the panel was opened.
+  /// Why: Link panel usage to a specific answer in the transcript.
+  openedAfterMessageSeq Int?
+
+  /// What: Message sequence after which the panel was closed.
+  /// Why: Link panel usage to a specific answer in the transcript.
+  closedAfterMessageSeq Int?
+
+  /// What: Optional thread foreign key.
+  /// Why: Identify which thread was active.
+  chatThreadId String?     @db.Uuid
+  chatThread   ChatThread? @relation(fields: [chatThreadId], references: [id], onDelete: SetNull)
+
+  @@index([taskSessionId, openedAt])
+}
+
+/**
+ * =========================
+ * SURVEYS (standardized)
+ * =========================
+ */
+
+enum SurveyPhase {
+  PRE
+  TASK1_POST
+  TASK2_POST
+  TASK3_POST
+  FINAL
+}
+
+enum SurveyQuestionType {
+  /// What: Exactly one option.
+  /// Why: Standard single-choice questions.
+  SINGLE_CHOICE
+
+  /// What: Multiple options.
+  /// Why: Standard multi-choice questions.
+  MULTI_CHOICE
+
+  /// What: Numeric rating scale (e.g. 1..10).
+  /// Why: Confidence/trust ratings with simple Int storage.
+  SCALE_NRS
+
+  /// What: Free text (optional).
+  /// Why: Keep available for rare cases; can be disabled in UI.
+  TEXT
+}
+
+model SurveyTemplate {
+  /// What: Primary key for a survey template.
+  /// Why: Versioned question sets independent of responses.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Study foreign key.
+  /// Why: Templates belong to a study.
+  studyId String @db.Uuid
+  study   Study  @relation(fields: [studyId], references: [id], onDelete: Cascade)
+
+  /// What: Stable template key (e.g. "pre", "final").
+  /// Why: Deterministic lookup in code.
+  key String
+
+  /// What: Human-readable name.
+  /// Why: UI/export clarity.
+  name String
+
+  /// What: Optional description.
+  /// Why: Documentation.
+  description String?
+
+  /// What: Created timestamp.
+  /// Why: Audit/versioning.
+  createdAt DateTime @default(now())
+
+  /// What: Updated timestamp.
+  /// Why: Audit/versioning.
+  updatedAt DateTime @updatedAt
+
+  /// What: Questions in this template.
+  /// Why: Complete template definition.
+  questions SurveyQuestion[]
+
+  /// What: Instances filled by participants.
+  /// Why: Responses are separate from templates.
+  instances SurveyInstance[]
+
+  @@unique([studyId, key])
+}
+
+model SurveyQuestion {
+  /// What: Primary key for a question.
+  /// Why: Join anchor.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Template foreign key.
+  /// Why: Group questions per template.
+  surveyTemplateId String         @db.Uuid
+  surveyTemplate   SurveyTemplate @relation(fields: [surveyTemplateId], references: [id], onDelete: Cascade)
+
+  /// What: Stable analysis key (e.g. "confidence_01").
+  /// Why: Exports remain stable even if text changes.
+  key String
+
+  /// What: Visible question text.
+  /// Why: Human-readable exports and UI.
+  text String
+
+  /// What: Question type.
+  /// Why: UI rendering + validation.
+  type SurveyQuestionType
+
+  /// What: Required flag.
+  /// Why: Enforce that participant selects an answer.
+  required Boolean @default(true)
+
+  /// What: Scale minimum for SCALE_NRS (e.g. 1).
+  /// Why: Self-describing scale configuration.
+  scaleMin Int?
+
+  /// What: Scale maximum for SCALE_NRS (e.g. 10).
+  /// Why: Self-describing scale configuration.
+  scaleMax Int?
+
+  /// What: Scale step for SCALE_NRS (usually 1).
+  /// Why: UI rendering consistency.
+  scaleStep Int?
+
+  /// What: Display order.
+  /// Why: Stable ordering across clients.
+  order Int
+
+  /// What: Choice options for SINGLE/MULTI.
+  /// Why: Standardized answers via option.value.
+  options SurveyOption[]
+
+  /// What: Answers referencing this question.
+  /// Why: Analytics joins.
+  answers SurveyAnswer[]
+
+  @@unique([surveyTemplateId, key])
+  @@index([surveyTemplateId, order])
+}
+
+model SurveyOption {
+  /// What: Primary key for an option.
+  /// Why: Join anchor.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Question foreign key.
+  /// Why: Options belong to exactly one question.
+  questionId String         @db.Uuid
+  question   SurveyQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  /// What: Machine-readable value (e.g. "1".."10" or "A"/"B").
+  /// Why: Standardized exports and easy stats.
+  value String
+
+  /// What: Human label shown in UI.
+  /// Why: UI rendering/readability.
+  label String
+
+  /// What: Display order.
+  /// Why: Stable ordering.
+  order Int
+
+  /// What: All SurveyAnswer rows that selected this option as SINGLE_CHOICE.
+  /// Why: Prisma requires an opposite relation field for SurveyAnswer.selectedOption.
+  selectedByAnswers SurveyAnswer[] @relation("SurveyAnswerSelectedOption")
+
+  /// What: All multi-choice join rows that reference this option.
+  /// Why: Prisma requires an opposite relation field for SurveyAnswerOption.option.
+  selectedByAnswerOptions SurveyAnswerOption[] @relation("SurveyAnswerOptionOption")
+
+  @@unique([questionId, value])
+  @@index([questionId, order])
+}
+
+model SurveyInstance {
+  /// What: Primary key for a filled survey.
+  /// Why: Groups answers per phase.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Participant foreign key.
+  /// Why: Tie responses to one participant.
+  participantId String      @db.Uuid
+  participant   Participant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+
+  /// What: Template foreign key.
+  /// Why: Know which question set was used.
+  surveyTemplateId String         @db.Uuid
+  surveyTemplate   SurveyTemplate @relation(fields: [surveyTemplateId], references: [id], onDelete: Restrict)
+
+  /// What: Phase enum (PRE, TASK1_POST, ...).
+  /// Why: Routing and analysis grouping.
+  phase SurveyPhase
+
+  /// What: Task session foreign key for post-task phases (optional).
+  /// Why: Link post-task responses to the task behavior.
+  taskSessionId String?      @db.Uuid
+  taskSession   TaskSession? @relation(fields: [taskSessionId], references: [id], onDelete: Cascade)
+
+  /// What: When survey page opened.
+  /// Why: Survey duration (startedAt → submittedAt).
+  startedAt DateTime @default(now())
+
+  /// What: When survey submitted.
+  /// Why: Survey duration.
+  submittedAt DateTime?
+
+  /// What: Answer rows.
+  /// Why: Actual responses.
+  answers SurveyAnswer[]
+
+  @@unique([participantId, phase])
+  @@index([participantId])
+  @@index([taskSessionId])
+}
+
+model SurveyAnswer {
+  /// What: Primary key for an answer row.
+  /// Why: Join anchor.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Survey instance foreign key.
+  /// Why: Group answers per phase.
+  surveyInstanceId String         @db.Uuid
+  surveyInstance   SurveyInstance @relation(fields: [surveyInstanceId], references: [id], onDelete: Cascade)
+
+  /// What: Question foreign key.
+  /// Why: Aggregate by stable question key later.
+  questionId String         @db.Uuid
+  question   SurveyQuestion @relation(fields: [questionId], references: [id], onDelete: Restrict)
+
+  /// What: Numeric value for SCALE_NRS (e.g. 1..10).
+  /// Why: Easy statistical analysis.
+  numericValue Int?
+
+  /// What: Selected option for SINGLE_CHOICE.
+  /// Why: Standardized value via option.value.
+  selectedOptionId String?       @db.Uuid
+  selectedOption   SurveyOption? @relation("SurveyAnswerSelectedOption", fields: [selectedOptionId], references: [id], onDelete: SetNull)
+
+  /// What: Text value for TEXT questions (optional).
+  /// Why: Rare free-text support without schema changes.
+  textValue String?
+
+  /// What: Multi-choice selections (join rows).
+  /// Why: Store multiple selected options cleanly.
+  selectedOptions SurveyAnswerOption[]
+
+  /// What: Timestamp.
+  /// Why: Audit.
+  createdAt DateTime @default(now())
+
+  @@unique([surveyInstanceId, questionId])
+  @@index([questionId])
+}
+
+model SurveyAnswerOption {
+  /// What: Primary key for join row.
+  /// Why: Join anchor.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Answer foreign key.
+  /// Why: Group selected options under one question answer.
+  answerId String       @db.Uuid
+  answer   SurveyAnswer @relation(fields: [answerId], references: [id], onDelete: Cascade)
+
+  /// What: Option foreign key.
+  /// Why: Standardized selected value.
+  optionId String       @db.Uuid
+  option   SurveyOption @relation("SurveyAnswerOptionOption", fields: [optionId], references: [id], onDelete: Restrict)
+
+  @@unique([answerId, optionId])
+  @@index([optionId])
+}
+
+/**
+ * =========================
+ * DATASET CATALOG (CSV metadata for Data Insights UI)
+ * =========================
+ * Purpose:
+ * - Store human-readable metadata for each CSV/dataset used by the SQL agent.
+ * - Allow mapping from SQL tables used in a query → one or more datasets (CSV files).
+ * Notes:
+ * - You explicitly said: “befüllen wir später” → these tables can remain empty initially.
+ * - The UI will show “-” placeholders when no match exists.
+ */
+
+model Dataset {
+  /// What: Primary key for a dataset (UUID).
+  /// Why: Stable identifier for management + joins.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Stable dataset key (e.g. "Sales_Report_Q4_2025.csv").
+  /// Why: Unique identifier shown in UI and used for imports.
+  key String @unique
+
+  /// What: Optional human-friendly display name.
+  /// Why: UI can show nicer names than raw filenames.
+  displayName String?
+
+  /// What: Source system / data warehouse name (e.g. "Finance Data Warehouse").
+  /// Why: Transparency label in the UI.
+  origin String?
+
+  /// What: Owner/author label (e.g. "Analytics Dept., Company A").
+  /// Why: Transparency label in the UI.
+  author String?
+
+  /// What: File type label (e.g. "csv").
+  /// Why: UI display.
+  fileType String?
+
+  /// What: File size in bytes (optional).
+  /// Why: UI display like “2.1 MB”.
+  fileSizeBytes BigInt?
+
+  /// What: Record count (optional).
+  /// Why: UI display like “5432 entries”.
+  recordCount Int?
+
+  /// What: Created timestamp.
+  /// Why: Audit.
+  createdAt DateTime @default(now())
+
+  /// What: Updated timestamp.
+  /// Why: Audit.
+  updatedAt DateTime @updatedAt
+
+  /// What: Mapping rows to SQL tables that belong to this dataset.
+  /// Why: Resolve “usedTables” → “CSV sources”.
+  tables DatasetTable[]
+}
+
+model DatasetTable {
+  /// What: Primary key for one dataset→table mapping row.
+  /// Why: Audit + join anchor.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: Dataset foreign key.
+  /// Why: Each row belongs to exactly one dataset.
+  datasetId String  @db.Uuid
+  dataset   Dataset @relation(fields: [datasetId], references: [id], onDelete: Cascade)
+
+  /// What: SQL table name used by the agent (e.g. "public.sales_q4_2025").
+  /// Why: This is what `ThreadDataQualityLog.usedTables` stores.
+  tableName String
+
+  @@unique([datasetId, tableName])
+  @@index([tableName])
+}
+
+/**
+ * =========================
+ * THREAD DATA QUALITY LOG (Side Panel / Indicators)
+ * =========================
+ */
+
+model ThreadDataQualityLog {
+  /// What: Primary key for one DQ log row.
+  /// Why: Append-only rows per user turn.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// What: LangGraph thread_id.
+  /// Why: Your requirement: link only by thread_id and always show latest in side panel.
+  langGraphThreadId String
+
+  /// What: When the DQ entry was created.
+  /// Why: Order latest-first per thread.
+  createdAt DateTime @default(now())
+
+  /// What: Data quality indicators JSON (currently only TIMELINESS).
+  /// Why: Flexible/extensible without schema changes.
+  indicators Json
+
+  /// What: Best-effort list of used dataset tables (schema.table).
+  /// Why: CSV mapping: "this answer was based on these tables".
+  usedTables String[]
+
+  /// What: The last SQL query used by the main system (optional).
+  /// Why: Audit/debug.
+  mainSql String?
+
+  /// What: The coverage SQL query used by the DQ system (optional).
+  /// Why: Audit/debug.
+  dqSql String?
+
+  @@index([langGraphThreadId, createdAt])
+}
