@@ -1,6 +1,6 @@
 services:
   postgres_langgraph:
-    image: postgres:latest
+    image: postgres:17.7
     restart: unless-stopped
     environment:
       POSTGRES_USER: langgraph
@@ -12,7 +12,7 @@ services:
       - pgdata_langgraph:/var/lib/postgresql/data
 
   postgres_app:
-    image: postgres:latest
+    image: postgres:17.7
     restart: unless-stopped
     environment:
       POSTGRES_USER: app
@@ -24,7 +24,7 @@ services:
       - pgdata_app:/var/lib/postgresql/data
 
   postgres_esg:
-    image: postgres:latest
+    image: postgres:17.7
     restart: unless-stopped
     environment:
       POSTGRES_USER: esg
